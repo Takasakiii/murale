@@ -42,7 +42,7 @@ murale fixes all of this in ~600 lines of Rust:
 ## Building
 
 ```bash
-git clone https://github.com/brentonkeller/murale.git
+git clone https://github.com/brenton-keller/murale.git
 cd murale
 cargo build --release
 ```
