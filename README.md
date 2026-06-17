@@ -4,7 +4,7 @@ A lean, memory-safe video wallpaper player for Wayland compositors. Built with R
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-![murale playing a 4K aerial video as wallpaper on a 7680x2160 ultrawide](docs/demo.gif)
+![murale playing a 4K aerial video as wallpaper on a 7680x2160 ultrawide at 240Hz](docs/demo.gif)
 
 ## Why murale?
 

@@ -1,11 +1,14 @@
 mod egl;
 mod error;
 
-use std::ffi::c_void;
+use std::collections::HashMap;
+use std::ffi::{c_void, CString};
+use std::io::{BufRead, BufReader};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
+use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -69,6 +72,110 @@ fn render_nonblocking(
     unsafe { libmpv2_sys::mpv_render_context_render(ctx, params.as_mut_ptr()) }
 }
 
+// --- Hyprland workspace switching ---
+
+struct MpvHandle(*mut libmpv2_sys::mpv_handle);
+unsafe impl Send for MpvHandle {}
+
+fn mpv_loadfile(handle: &MpvHandle, path: &str) {
+    let Ok(cmd) = CString::new("loadfile") else { return };
+    let Ok(path_c) = CString::new(path) else { return };
+    let args = [cmd.as_ptr(), path_c.as_ptr(), std::ptr::null()];
+    unsafe {
+        libmpv2_sys::mpv_command(handle.0, args.as_ptr() as *mut *const _);
+    }
+}
+
+fn get_active_workspace() -> Option<String> {
+    let output = std::process::Command::new("hyprctl")
+        .args(["activeworkspace", "-j"])
+        .output()
+        .ok()?;
+    let json = String::from_utf8(output.stdout).ok()?;
+    let start = json.find("\"name\":\"")? + 8;
+    let end = json[start..].find('"')? + start;
+    Some(json[start..end].to_string())
+}
+
+fn spawn_workspace_listener(
+    mpv_handle: MpvHandle,
+    workspace_map: HashMap<String, String>,
+    default_video: String,
+) -> Option<std::thread::JoinHandle<()>> {
+    let sig = match std::env::var("HYPRLAND_INSTANCE_SIGNATURE") {
+        Ok(s) => s,
+        Err(_) => {
+            tracing::warn!(
+                "--workspace specified but HYPRLAND_INSTANCE_SIGNATURE not set; \
+                 workspace switching disabled"
+            );
+            return None;
+        }
+    };
+
+    let xdg = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/run/user/1000".into());
+    let socket_path = format!("{xdg}/hypr/{sig}/.socket2.sock");
+
+    // Load the correct video for the active workspace at startup
+    if let Some(active) = get_active_workspace() {
+        if let Some(video) = workspace_map.get(&active) {
+            if *video != default_video {
+                tracing::info!("workspace {active}: loading {video}");
+                mpv_loadfile(&mpv_handle, video);
+            }
+        }
+    }
+
+    let jh = std::thread::spawn(move || {
+        let stream = match UnixStream::connect(&socket_path) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!("could not connect to Hyprland event socket: {e}");
+                return;
+            }
+        };
+
+        if let Err(e) = stream.set_read_timeout(Some(Duration::from_secs(1))) {
+            tracing::warn!("could not set socket timeout: {e}");
+            return;
+        }
+
+        tracing::info!("workspace switching active ({} mappings)", workspace_map.len());
+
+        let mut reader = BufReader::new(stream);
+        let mut buf = String::new();
+        let mut current_video = default_video.clone();
+
+        loop {
+            if SHUTDOWN.load(Ordering::Relaxed) {
+                break;
+            }
+
+            buf.clear();
+            match reader.read_line(&mut buf) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                Err(_) => break,
+            }
+
+            let line = buf.trim_end();
+            if let Some(name) = line.strip_prefix("workspace>>") {
+                let video = workspace_map
+                    .get(name)
+                    .unwrap_or(&default_video);
+
+                if *video != current_video {
+                    tracing::info!("workspace {name}: loading {video}");
+                    mpv_loadfile(&mpv_handle, video);
+                    current_video = video.clone();
+                }
+            }
+        }
+    });
+    Some(jh)
+}
+
 // --- Frame timing instrumentation ---
 
 struct FrameStats {
@@ -115,6 +222,8 @@ impl FrameStats {
     }
 }
 
+// --- CLI ---
+
 #[derive(Parser)]
 #[command(
     about = "Lean, memory-safe video wallpaper player for Wayland compositors",
@@ -123,16 +232,24 @@ EXAMPLES:
     murale ~/Videos/wallpaper.mp4
     murale ~/Videos/wallpaper.mp4 --output DP-2
     murale ~/Videos/wallpaper.mp4 --mpv-options \"input-ipc-server=/tmp/murale.sock\"
+    murale --workspace 1=~/Videos/forest.mp4 --workspace 2=~/Videos/ocean.mp4 ~/Videos/default.mp4
     murale ~/Videos/wallpaper.mp4 --stats"
 )]
 struct Cli {
-    /// Path to video file (any format mpv supports)
+    /// Path to video file (any format mpv supports). Used as the default/fallback
+    /// when no --workspace mapping matches.
     video: String,
 
     /// Target a specific display output by name (e.g. DP-1, HDMI-A-1).
     /// Run without this flag to see available outputs listed in the log.
     #[arg(short, long)]
     output: Option<String>,
+
+    /// Map a Hyprland workspace to a video. Can be repeated.
+    /// When switching to a mapped workspace, the corresponding video loads.
+    /// Unmapped workspaces use the default video.
+    #[arg(short, long, value_name = "N=PATH")]
+    workspace: Vec<String>,
 
     /// Pass options to mpv as comma-separated key=value pairs.
     /// Example: --mpv-options "input-ipc-server=/tmp/murale.sock,volume=0"
@@ -143,6 +260,8 @@ struct Cli {
     #[arg(long)]
     stats: bool,
 }
+
+// --- Main state ---
 
 struct Murale {
     // SCTK state
@@ -377,7 +496,7 @@ impl Murale {
         for output in self.output_state.outputs() {
             if let Some(info) = self.output_state.info(&output) {
                 if info.name.as_deref() == Some(name) {
-                    tracing::info!("target output matched: {name}");
+                    tracing::info!("output: {name}");
                     return Some(output);
                 }
             }
@@ -555,6 +674,15 @@ impl ProvidesRegistryState for Murale {
 fn run() -> Result<()> {
     let cli = Cli::parse();
 
+    let workspace_map: HashMap<String, String> = cli
+        .workspace
+        .iter()
+        .filter_map(|s| {
+            let (k, v) = s.split_once('=')?;
+            Some((k.trim().to_string(), v.trim().to_string()))
+        })
+        .collect();
+
     unsafe {
         libc::signal(libc::SIGINT, handle_signal as *const () as libc::sighandler_t);
         libc::signal(libc::SIGTERM, handle_signal as *const () as libc::sighandler_t);
@@ -607,7 +735,7 @@ fn run() -> Result<()> {
         stats_enabled: cli.stats,
         frame_stats: FrameStats::new(),
         exit: false,
-        video_path: cli.video,
+        video_path: cli.video.clone(),
         mpv_options: cli.mpv_options,
         wl_display_ptr,
     };
@@ -635,8 +763,20 @@ fn run() -> Result<()> {
 
     state.layer = Some(layer);
 
+    // Start workspace listener after mpv is initialized (happens in configure handler).
+    // For now, stash the workspace map; we'll spawn the listener thread once mpv is ready.
+    // Since init_mpv runs synchronously during the first configure event, we can check
+    // after the first dispatch.
+    let workspace_map_for_thread = if workspace_map.is_empty() {
+        None
+    } else {
+        Some((workspace_map, cli.video))
+    };
+
     let wl_fd = conn.as_fd();
     tracing::debug!("entering main loop");
+
+    let mut workspace_join_handle: Option<std::thread::JoinHandle<()>> = None;
 
     loop {
         if SHUTDOWN.load(Ordering::Relaxed) {
@@ -686,12 +826,25 @@ fn run() -> Result<()> {
             state.handle_mpv_wakeup();
         }
 
+        if workspace_join_handle.is_none() {
+            if let (Some(mpv), Some((ref map, ref default_video))) =
+                (&state.mpv, &workspace_map_for_thread)
+            {
+                let handle = MpvHandle(mpv.ctx.as_ptr());
+                workspace_join_handle =
+                    spawn_workspace_listener(handle, map.clone(), default_video.clone());
+            }
+        }
+
         if state.exit {
             break;
         }
     }
 
     tracing::info!("shutting down");
+    if let Some(jh) = workspace_join_handle {
+        let _ = jh.join();
+    }
     state.render_ctx.take();
     state.mpv.take();
     state.egl_state.take();
