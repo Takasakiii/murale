@@ -1,0 +1,27 @@
+[package]
+name = "murale"
+version = "1.0.0"
+edition = "2021"
+description = "Lean, memory-safe video wallpaper player for Wayland compositors"
+license = "MIT"
+repository = "https://github.com/brentonkeller/murale"
+keywords = ["wayland", "wallpaper", "video", "hyprland", "mpv"]
+categories = ["multimedia::video", "os::linux-apis"]
+readme = "README.md"
+
+[dependencies]
+smithay-client-toolkit = "0.20"
+wayland-client = "0.31"
+wayland-egl = "0.32"
+khronos-egl = { version = "6", features = ["dynamic"] }
+libloading = "0.8"
+gl = "0.14"
+libmpv2 = { path = "vendor/libmpv2", features = ["render"] }
+libmpv2-sys = "4"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+nix = { version = "0.29", features = ["event", "poll"] }
+libc = "0.2"
