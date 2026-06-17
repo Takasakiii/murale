@@ -381,6 +381,11 @@ impl Murale {
         if let Err(e) = self.egl_instance.swap_buffers(egl_state.display, egl_state.surface) {
             tracing::error!("eglSwapBuffers failed: {e:?}");
             self.frame_callback_pending = false;
+            return;
+        }
+
+        unsafe {
+            libmpv2_sys::mpv_render_context_report_swap(render_ctx.ctx);
         }
     }
 
@@ -429,7 +434,7 @@ impl Murale {
 
         mpv.set_property("vo", "libmpv")?;
         mpv.set_property("hwdec", "auto")?;
-        mpv.set_property("video-sync", "display-resample")?;
+        mpv.set_property("video-sync", "desync")?;
         mpv.set_property("loop-file", "inf")?;
         mpv.set_property("keepaspect", true)?;
         mpv.set_property("panscan", 1.0f64)?;

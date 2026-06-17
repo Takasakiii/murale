@@ -39,6 +39,14 @@ murale fixes all of this in ~600 lines of Rust:
 
 **Note:** GNOME/Mutter does not support `wlr-layer-shell`. This is the same limitation as mpvpaper.
 
+### mpv version
+
+mpv >= 0.42.0 (or a git build including [PR #17303](https://github.com/mpv-player/mpv/pull/17303)) is recommended. Earlier versions have a [fence leak](https://github.com/mpv-player/mpv/issues/17217) in the libmpv render API that causes memory growth over time. This affects all libmpv embedders (mpvpaper, Qt, etc.), not just murale.
+
+On Arch Linux: `sudo pacman -S mpv-git` (CachyOS) or install `mpv-git` from the AUR.
+
+To revert: `sudo pacman -S mpv`
+
 ## Building
 
 ```bash
