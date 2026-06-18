@@ -116,7 +116,6 @@ fn spawn_workspace_listener(
     let xdg = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/run/user/1000".into());
     let socket_path = format!("{xdg}/hypr/{sig}/.socket2.sock");
 
-    // Load the correct video for the active workspace at startup
     if let Some(active) = get_active_workspace() {
         if let Some(video) = workspace_map.get(&active) {
             if *video != default_video {
@@ -267,14 +266,16 @@ struct Murale {
     // SCTK state
     registry_state: RegistryState,
     output_state: OutputState,
+    compositor_state: CompositorState,
+    layer_shell: LayerShell,
     qh: QueueHandle<Self>,
 
-    // Layer surface — None until after output discovery roundtrip
+    // Layer surface — None when output is disconnected
     layer: Option<LayerSurface>,
+    target_output_name: Option<String>,
 
-    // EGL — display/config/context are duplicated here and inside EglState.
-    // TODO: consolidate when adding monitor hotplug (EglState recreation needs
-    // the display/config/context to survive surface teardown).
+    // EGL — display/config/context survive output reconnects.
+    // Only the per-surface EglState is recreated.
     egl_instance: Arc<egl::EglInstance>,
     egl_state: Option<egl::EglState>,
     egl_display: kegl::Display,
@@ -289,6 +290,7 @@ struct Murale {
     wakeup_fd: EventFd,
 
     // Frame state
+    initialized: bool,
     first_configure: bool,
     width: u32,
     height: u32,
@@ -311,8 +313,35 @@ struct Murale {
 }
 
 impl Murale {
-    fn layer(&self) -> &LayerSurface {
-        self.layer.as_ref().expect("layer surface not initialized")
+    fn create_layer_surface(&mut self, output: Option<&wl_output::WlOutput>) {
+        let surface = self.compositor_state.create_surface(&self.qh);
+        let layer = self.layer_shell.create_layer_surface(
+            &self.qh,
+            surface,
+            Layer::Background,
+            Some("murale"),
+            output,
+        );
+        layer.set_anchor(Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT);
+        layer.set_exclusive_zone(-1);
+        layer.set_keyboard_interactivity(KeyboardInteractivity::None);
+        layer.set_size(0, 0);
+        layer.commit();
+        self.layer = Some(layer);
+
+        // Reset so configure handler creates new EGL surface
+        // (mpv/render_ctx survive — only the EGL surface is per-output)
+        self.first_configure = true;
+        self.frame_callback_pending = false;
+        self.redraw_needed = false;
+    }
+
+    fn teardown_surface(&mut self) {
+        self.egl_state.take();
+        self.layer.take();
+        self.frame_callback_pending = false;
+        self.redraw_needed = false;
+        tracing::info!("surface torn down (output lost)");
     }
 
     fn render_frame(&mut self) {
@@ -434,7 +463,7 @@ impl Murale {
 
         mpv.set_property("vo", "libmpv")?;
         mpv.set_property("hwdec", "auto")?;
-        mpv.set_property("video-sync", "desync")?;
+        mpv.set_property("video-sync", "display-resample")?;
         mpv.set_property("loop-file", "inf")?;
         mpv.set_property("keepaspect", true)?;
         mpv.set_property("panscan", 1.0f64)?;
@@ -501,15 +530,8 @@ impl Murale {
         for output in self.output_state.outputs() {
             if let Some(info) = self.output_state.info(&output) {
                 if info.name.as_deref() == Some(name) {
-                    tracing::info!("output: {name}");
                     return Some(output);
                 }
-            }
-        }
-        tracing::warn!("output '{name}' not found, available outputs:");
-        for output in self.output_state.outputs() {
-            if let Some(info) = self.output_state.info(&output) {
-                tracing::warn!("  {:?}", info.name.as_deref().unwrap_or("(unnamed)"));
             }
         }
         None
@@ -557,8 +579,14 @@ impl CompositorHandler for Murale {
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
         _surface: &wl_surface::WlSurface,
-        _output: &wl_output::WlOutput,
+        output: &wl_output::WlOutput,
     ) {
+        let name = self
+            .output_state
+            .info(output)
+            .and_then(|i| i.name.clone())
+            .unwrap_or_else(|| "(unknown)".into());
+        tracing::info!("surface entered output {name}");
     }
 
     fn surface_leave(
@@ -566,8 +594,14 @@ impl CompositorHandler for Murale {
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
         _surface: &wl_surface::WlSurface,
-        _output: &wl_output::WlOutput,
+        output: &wl_output::WlOutput,
     ) {
+        let name = self
+            .output_state
+            .info(output)
+            .and_then(|i| i.name.clone())
+            .unwrap_or_else(|| "(unknown)".into());
+        tracing::warn!("surface left output {name}");
     }
 }
 
@@ -580,31 +614,65 @@ impl OutputHandler for Murale {
         &mut self,
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
-        _output: wl_output::WlOutput,
+        output: wl_output::WlOutput,
     ) {
+        let target = match &self.target_output_name {
+            Some(name) => name.clone(),
+            None => return,
+        };
+
+        let name = self
+            .output_state
+            .info(&output)
+            .and_then(|i| i.name.clone());
+
+        if name.as_deref() == Some(&target) && self.initialized && self.layer.is_none() {
+            tracing::info!("output {target} reconnected, recreating surface");
+            self.create_layer_surface(Some(&output));
+        }
     }
 
     fn update_output(
         &mut self,
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
-        _output: wl_output::WlOutput,
+        output: wl_output::WlOutput,
     ) {
+        let name = self
+            .output_state
+            .info(&output)
+            .and_then(|i| i.name.clone())
+            .unwrap_or_else(|| "(unknown)".into());
+        tracing::debug!("output updated: {name}");
     }
 
     fn output_destroyed(
         &mut self,
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
-        _output: wl_output::WlOutput,
+        output: wl_output::WlOutput,
     ) {
+        let target = match &self.target_output_name {
+            Some(name) => name,
+            None => return,
+        };
+
+        let name = self
+            .output_state
+            .info(&output)
+            .and_then(|i| i.name.clone());
+
+        if name.as_deref() == Some(target.as_str()) {
+            tracing::info!("output {target} disconnected");
+            self.teardown_surface();
+        }
     }
 }
 
 impl LayerShellHandler for Murale {
     fn closed(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _layer: &LayerSurface) {
-        tracing::info!("layer surface closed by compositor");
-        self.exit = true;
+        tracing::warn!("layer surface closed by compositor");
+        self.teardown_surface();
     }
 
     fn configure(
@@ -632,12 +700,17 @@ impl LayerShellHandler for Murale {
             let scaled_w = (w * self.scale) as i32;
             let scaled_h = (h * self.scale) as i32;
 
+            let layer = match &self.layer {
+                Some(l) => l,
+                None => return,
+            };
+
             match egl::create_surface(
                 &self.egl_instance,
                 self.egl_display,
                 self.egl_config,
                 self.egl_context,
-                self.layer().wl_surface(),
+                layer.wl_surface(),
                 scaled_w,
                 scaled_h,
             ) {
@@ -649,12 +722,18 @@ impl LayerShellHandler for Murale {
                 }
             }
 
-            if let Err(e) = self.init_mpv() {
-                tracing::error!("failed to initialize mpv: {e}");
-                self.exit = true;
-                return;
+            // Only init mpv on the very first configure — it survives reconnects
+            if self.mpv.is_none() {
+                if let Err(e) = self.init_mpv() {
+                    tracing::error!("failed to initialize mpv: {e}");
+                    self.exit = true;
+                    return;
+                }
+            } else {
+                tracing::info!("surface recreated, resuming playback");
             }
 
+            self.initialized = true;
             self.render_frame();
         } else if let Some(egl_state) = &self.egl_state {
             let scaled_w = (w * self.scale) as i32;
@@ -700,7 +779,7 @@ fn run() -> Result<()> {
         .map_err(|e| anyhow::anyhow!("Wayland registry init failed: {e}"))?;
     let qh = event_queue.handle();
 
-    let compositor = CompositorState::bind(&globals, &qh)
+    let compositor_state = CompositorState::bind(&globals, &qh)
         .context("compositor does not support wl_compositor")?;
     let layer_shell = LayerShell::bind(&globals, &qh).context(
         "compositor does not support wlr-layer-shell (required for wallpaper surfaces)",
@@ -720,8 +799,11 @@ fn run() -> Result<()> {
     let mut state = Murale {
         registry_state: RegistryState::new(&globals),
         output_state,
+        compositor_state,
+        layer_shell,
         qh: qh.clone(),
         layer: None,
+        target_output_name: cli.output.clone(),
         egl_instance,
         egl_state: None,
         egl_display,
@@ -730,6 +812,7 @@ fn run() -> Result<()> {
         render_ctx: None,
         mpv: None,
         wakeup_fd,
+        initialized: false,
         first_configure: true,
         width: 0,
         height: 0,
@@ -752,26 +835,21 @@ fn run() -> Result<()> {
         .as_deref()
         .and_then(|name| state.find_target_output(name));
 
-    let surface = compositor.create_surface(&qh);
-    let layer = layer_shell.create_layer_surface(
-        &qh,
-        surface,
-        Layer::Background,
-        Some("murale"),
-        target_output.as_ref(),
-    );
-    layer.set_anchor(Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT);
-    layer.set_exclusive_zone(-1);
-    layer.set_keyboard_interactivity(KeyboardInteractivity::None);
-    layer.set_size(0, 0);
-    layer.commit();
+    if let Some(name) = &cli.output {
+        if target_output.is_none() {
+            tracing::warn!("output '{name}' not found, available:");
+            for out in state.output_state.outputs() {
+                if let Some(info) = state.output_state.info(&out) {
+                    tracing::warn!("  {:?}", info.name.as_deref().unwrap_or("(unnamed)"));
+                }
+            }
+        } else {
+            tracing::info!("output: {name}");
+        }
+    }
 
-    state.layer = Some(layer);
+    state.create_layer_surface(target_output.as_ref());
 
-    // Start workspace listener after mpv is initialized (happens in configure handler).
-    // For now, stash the workspace map; we'll spawn the listener thread once mpv is ready.
-    // Since init_mpv runs synchronously during the first configure event, we can check
-    // after the first dispatch.
     let workspace_map_for_thread = if workspace_map.is_empty() {
         None
     } else {
@@ -818,9 +896,6 @@ fn run() -> Result<()> {
             }
         }
 
-        // Always check mpv wakeups — EFD_NONBLOCK returns EAGAIN instantly if empty.
-        // This catches signals that arrive when prepare_read() returns None
-        // (buffered Wayland events skip the poll block entirely).
         if !mpv_ready && state.wakeup_fd.read().is_ok() {
             mpv_ready = true;
         }
@@ -853,6 +928,8 @@ fn run() -> Result<()> {
     state.render_ctx.take();
     state.mpv.take();
     state.egl_state.take();
+    let _ = state.egl_instance.destroy_context(state.egl_display, state.egl_context);
+    let _ = state.egl_instance.terminate(state.egl_display);
 
     Ok(())
 }

@@ -148,9 +148,5 @@ impl Drop for EglState {
         tracing::debug!("destroying EGL surface");
         let _ = self.egl.make_current(self.display, None, None, None);
         let _ = self.egl.destroy_surface(self.display, self.surface);
-        tracing::debug!("destroying EGL context");
-        let _ = self.egl.destroy_context(self.display, self.context);
-        tracing::debug!("terminating EGL display");
-        let _ = self.egl.terminate(self.display);
     }
 }
